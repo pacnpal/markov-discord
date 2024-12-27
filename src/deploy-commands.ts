@@ -21,9 +21,6 @@ export const inviteCommand = new SlashCommandBuilder()
 export const messageCommand = new SlashCommandBuilder()
   .setName(config.slashCommandName)
   .setDescription('Generate a message from learned past messages')
-  .addBooleanOption((tts) =>
-    tts.setName('tts').setDescription('Read the message via text-to-speech.').setRequired(false),
-  )
   .addBooleanOption((debug) =>
     debug
       .setName('debug')
@@ -48,6 +45,38 @@ const channelOptionsGenerator = (builder: SlashCommandChannelOption, index: numb
     .setDescription('A text channel')
     .setRequired(index === 0)
     .addChannelTypes(ChannelType.GuildText);
+
+export const autoRespondCommand = new SlashCommandBuilder()
+  .setName('autorespond')
+  .setDescription('Configure channels where the bot will automatically respond to all messages')
+  .addSubcommand((sub) => {
+    sub
+      .setName('add')
+      .setDescription('Add channels where the bot will automatically respond to all messages');
+    Array.from(Array(CHANNEL_OPTIONS_MAX).keys()).forEach((index) =>
+      sub.addChannelOption((opt) => channelOptionsGenerator(opt, index)),
+    );
+    return sub;
+  })
+  .addSubcommand((sub) => {
+    sub
+      .setName('remove')
+      .setDescription('Remove channels from auto-response');
+    Array.from(Array(CHANNEL_OPTIONS_MAX).keys()).forEach((index) =>
+      sub.addChannelOption((opt) => channelOptionsGenerator(opt, index)),
+    );
+    return sub;
+  })
+  .addSubcommand((sub) =>
+    sub
+      .setName('list')
+      .setDescription('List the channels where the bot auto-responds to messages'),
+  )
+  .addSubcommand((sub) =>
+    sub
+      .setName('modify')
+      .setDescription('Add or remove auto-respond channels via select menu UI (first 25 text channels only)'),
+  );
 
 export const listenChannelCommand = new SlashCommandBuilder()
   .setName('listen')
@@ -110,7 +139,8 @@ const commands = [
   inviteCommand.toJSON(),
   messageCommand.toJSON(),
   listenChannelCommand.toJSON(),
-  trainCommand.toJSON(),
+  autoRespondCommand.toJSON(),
+  trainCommand.toJSON()
 ];
 
 export async function deployCommands(clientId: string) {

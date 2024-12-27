@@ -68,3 +68,6 @@ error.json
 markovDB.json
 
 /config/
+/exports/
+/build/
+/dist/

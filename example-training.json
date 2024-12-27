@@ -1,0 +1,21 @@
+[
+  {
+    "message": "Hello world!",
+    "attachments": []
+  },
+  {
+    "message": "This is an example message with an attachment",
+    "attachments": ["https://example.com/image.jpg"]
+  },
+  {
+    "message": "Another training message",
+    "attachments": []
+  },
+  {
+    "message": "Messages can have multiple attachments",
+    "attachments": [
+      "https://example.com/image1.jpg",
+      "https://example.com/image2.jpg"
+    ]
+  }
+]

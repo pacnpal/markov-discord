@@ -163,4 +163,19 @@ export class AppConfig {
   @IsOptional()
   @IsString()
   devGuildId = process.env.DEV_GUILD_ID;
+
+  /**
+   * A list of channel IDs where the bot will respond to mentions.
+   * If empty, the bot will respond to mentions in any channel.
+   * @example ["734548250895319070"]
+   * @default []
+   * @env RESPONSE_CHANNEL_IDS (comma separated)
+   */
+  @IsArray()
+  @IsString({ each: true })
+  @Type(() => String)
+  @IsOptional()
+  responseChannelIds = process.env.RESPONSE_CHANNEL_IDS
+    ? process.env.RESPONSE_CHANNEL_IDS.split(',').map((id) => id.trim())
+    : [];
 }

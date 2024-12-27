@@ -12,6 +12,11 @@ export class Channel extends BaseEntity {
   })
   listen: boolean;
 
+  @Column({
+    default: false,
+  })
+  autoRespond: boolean;
+
   @ManyToOne(() => Guild, (guild) => guild.channels)
   guild: Guild;
 }

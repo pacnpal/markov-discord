@@ -14,10 +14,66 @@ A Markov chain bot using markov-strings.
     * User: `/mark`
     * Bot: ![worms are not baby snakes, by the way](img/respond.png)
 
-### Training from a file
+### Training from files
 
-Using the `json` option in the `/train` command, you can import a list of messages.
+You can train the bot using JSON files in two ways:
+
+1. Using the `json` option in the `/train` command to import a single file of messages.
+2. Using the command line to train from either a single file or an entire directory of JSON files.
+
+#### Using the Discord Command
+Use the `json` option in the `/train` command to import a single file of messages.
 An example JSON file can be seen [here](img/example-training.json).
+
+#### Using the Command Line
+For bulk training from multiple files, you can use the command line interface. First, build the training script:
+
+```bash
+# Build the TypeScript files
+npm run build
+```
+
+Then you can use the training script:
+
+```bash
+# Train from a single JSON file
+node build/train.js <guildId> <jsonPath> [--keep-existing]
+
+# Train from all JSON files in a directory
+node build/train.js <guildId> <directoryPath> --directory [--keep-existing] [--expose-gc]
+```
+
+Options:
+- `--keep-existing`: Don't clear existing training data before importing
+- `--directory`: Process all JSON files in the specified directory
+- `--expose-gc`: Enable garbage collection for better memory management (recommended for large directories)
+
+Each JSON file should contain an array of messages in this format:
+```json
+[
+  {
+    "message": "Message content",
+    "attachments": ["optional", "attachment", "urls"]
+  }
+]
+```
+
+When training from a directory:
+- All .json files in the directory will be processed
+- Files are processed sequentially to manage memory usage
+- Progress is shown for each file
+- A total count of processed messages is provided at the end
+
+Security and Performance Notes:
+- The directory must be within the project's working directory for security
+- The process will create lock files in the config directory to prevent concurrent training
+- Memory usage is monitored and managed automatically
+- For large directories, use the `--expose-gc` flag for better memory management:
+  ```bash
+  node --expose-gc build/train.js <guildId> <directoryPath> --directory
+  ```
+- Training can be safely interrupted with Ctrl+C; state will be preserved
+- Use `--keep-existing` to resume interrupted training
 
 ## Setup
 
