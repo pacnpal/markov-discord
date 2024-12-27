@@ -27,13 +27,13 @@ You can train the bot using JSON files in several ways:
 If you have JSON files exported from [DiscordChatExporter](https://github.com/Tyrrrz/DiscordChatExporter), you can use the included discord-parser.py script to convert them into the format required for training:
 
 1. Export your Discord channel history using DiscordChatExporter in JSON format
-2. Run the parser on your exported files:
+2. Run the parser (located in ./imports directory) on your exported files:
    ```bash
-   python3 discord-parser.py input_file.json output_file.json
+   python3 ./imports/discord-parser.py -i input_file.json -o output_file.json
    ```
    Or process an entire directory of exported files:
    ```bash
-   python3 discord-parser.py input_directory/ output_directory/
+   python3 ./imports/discord-parser.py -i input_directory/ -o output_directory/
    ```
 3. Use the converted files with train.js for bulk training (see "Using the Command Line" below)
 
