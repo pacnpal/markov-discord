@@ -16,10 +16,28 @@ A Markov chain bot using markov-strings.
 
 ### Training from files
 
-You can train the bot using JSON files in two ways:
+You can train the bot using JSON files in several ways:
 
 1. Using the `json` option in the `/train` command to import a single file of messages.
 2. Using the command line to train from either a single file or an entire directory of JSON files.
+3. Using discord-parser.py to convert DiscordChatExporter files for bulk training.
+
+#### Using DiscordChatExporter with discord-parser.py
+
+If you have JSON files exported from [DiscordChatExporter](https://github.com/Tyrrrz/DiscordChatExporter), you can use the included discord-parser.py script to convert them into the format required for training:
+
+1. Export your Discord channel history using DiscordChatExporter in JSON format
+2. Run the parser on your exported files:
+   ```bash
+   python3 discord-parser.py input_file.json output_file.json
+   ```
+   Or process an entire directory of exported files:
+   ```bash
+   python3 discord-parser.py input_directory/ output_directory/
+   ```
+3. Use the converted files with train.js for bulk training (see "Using the Command Line" below)
+
+The parser will convert DiscordChatExporter's format into the simple message format required by the bot, making it easy to import large channel histories.
 
 #### Using the Discord Command
 Use the `json` option in the `/train` command to import a single file of messages.
