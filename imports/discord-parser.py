@@ -93,7 +93,7 @@ def process_directory(input_dir, output_dir):
         else:
             failure_count += 1
     
-    print(f"\nProcessing complete:")
+    print("\nProcessing complete:")
     print(f"Successfully processed: {success_count} files")
     print(f"Failed to process: {failure_count} files")
 
