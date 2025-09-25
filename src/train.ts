@@ -223,6 +223,7 @@ async function trainFromDirectory(
   guildId: string,
   dirPath: string,
   clean = true,
+  forceRetrain = false,
 ): Promise<string> {
   L.debug({ guildId, dirPath, clean }, 'Starting directory training');
   const stateManager = new TrainingStateManager(guildId, CONFIG_DIR);
@@ -274,6 +275,10 @@ async function trainFromDirectory(
       for (let i = 0; i < jsonFiles.length; i++) {
         const jsonPath = path.join(absolutePath, jsonFiles[i]);
         const fileNumber = i + 1;
+        // Log progress to console
+        console.log(`\nProcessing file ${fileNumber}/${jsonFiles.length}: ${jsonFiles[i]}`);
+        console.log(`${jsonFiles.length - fileNumber} files remaining\n`);
+        
         L.debug(
           { file: jsonFiles[i], progress: `${fileNumber}/${jsonFiles.length}` },
           'Processing file'
@@ -288,11 +293,17 @@ async function trainFromDirectory(
             global.gc?.(); // Optional garbage collection if --expose-gc flag is used
           }
 
-          // Check if we should skip this file (already processed)
-          if (!clean && stateManager.isChannelProcessed(jsonFiles[i])) {
-            L.debug({ file: jsonFiles[i] }, 'Skipping already processed file');
+          // Check if file was already processed
+          if (!clean && !forceRetrain && stateManager.isChannelProcessed(jsonFiles[i])) {
+            console.log(`\nSkipping ${jsonFiles[i]} - already processed`);
+            console.log(`Use --force-retrain to process this file again`);
+            console.log(`${jsonFiles.length - fileNumber} files remaining\n`);
             continue;
           }
+
+          // Log progress to console
+          console.log(`\nProcessing file ${fileNumber}/${jsonFiles.length}: ${jsonFiles[i]}`);
+          console.log(`${jsonFiles.length - fileNumber} files remaining\n`);
 
           const result = await trainFromJson(
             guildId,
@@ -359,10 +370,11 @@ async function trainFromDirectory(
 async function main(): Promise<void> {
   const args = process.argv.slice(2);
   if (args.length < 2) {
-    console.log('Usage: node train.js <guildId> <path> [--keep-existing] [--directory]');
+    console.log('Usage: node train.js <guildId> <path> [--keep-existing] [--directory] [--force-retrain]');
     console.log('Options:');
     console.log('  --keep-existing  Keep existing training data');
     console.log('  --directory      Process all JSON files in the specified directory');
+    console.log('  --force-retrain  Force retraining on files even if already processed');
     process.exit(1);
   }
 
@@ -370,6 +382,7 @@ async function main(): Promise<void> {
   const inputPath = args[1];
   const keepExisting = args.includes('--keep-existing');
   const isDirectory = args.includes('--directory');
+  const forceRetrain = args.includes('--force-retrain');
 
   const dataSourceOptions = Markov.extendDataSourceOptions(ormconfig);
   const dataSource = new DataSource(dataSourceOptions);
@@ -379,7 +392,7 @@ async function main(): Promise<void> {
   await Guild.upsert(Guild.create({ id: guildId }), ['id']);
 
   const result = isDirectory
-    ? await trainFromDirectory(guildId, inputPath, !keepExisting)
+    ? await trainFromDirectory(guildId, inputPath, !keepExisting, forceRetrain)
     : await trainFromJson(guildId, inputPath, !keepExisting);
   console.log(result);
 
