@@ -12,8 +12,8 @@ import { DataSource } from 'typeorm';
 import { MarkovInputData } from 'markov-strings-db/dist/src/entity/MarkovInputData';
 import type { PackageJsonPerson } from 'types-package-json';
 import makeEta from 'simple-eta';
-import formatDistanceToNow from 'date-fns/formatDistanceToNow';
-import addSeconds from 'date-fns/addSeconds';
+import { formatDistanceToNow } from 'date-fns/formatDistanceToNow';
+import { addSeconds } from 'date-fns/addSeconds';
 import L from './logger';
 import { Channel } from './entity/Channel';
 import { Guild } from './entity/Guild';
@@ -30,6 +30,15 @@ import {
 } from './deploy-commands';
 import { getRandomElement, getVersion, packageJson } from './util';
 import ormconfig from './ormconfig';
+
+// Caching system for performance optimization
+const cdnUrlCache = new Map<string, { url: string; expires: number }>();
+const attachmentCache = new Map<string, any[]>();
+
+/**
+ * Recursively gets all messages in a text channel's history.
+ */
+import { TrainingStateManager } from './training-state';
 
 interface MarkovDataCustom {
   attachments: string[];
@@ -52,15 +61,15 @@ interface IRefreshUrlsRes {
 /**
  * Reply options that can be used in both MessageOptions and InteractionReplyOptions
  */
-type AgnosticReplyOptions = Omit<Discord.MessageCreateOptions, 'reply' | 'stickers' | 'flags'>;
+type AgnosticReplyOptions = Partial<Omit<Discord.MessageCreateOptions, 'reply' | 'stickers' | 'flags' | 'message_reference'>>;
 
 const INVALID_PERMISSIONS_MESSAGE = 'You do not have the permissions for this action.';
 const INVALID_GUILD_MESSAGE = 'This action must be performed within a server.';
 
-const rest = new Discord.REST({ 
-version: '10',
-timeout: 120000,  // 120 seconds
-retries: 3
+const rest = new Discord.REST({
+  version: '10',
+  timeout: 120000, // 120 seconds
+  retries: 3,
 }).setToken(config.token);
 
 const client = new Discord.Client<true>({
@@ -68,7 +77,7 @@ const client = new Discord.Client<true>({
   intents: [
     Discord.GatewayIntentBits.GuildMessages,
     Discord.GatewayIntentBits.Guilds,
-    Discord.GatewayIntentBits.GuildMembers
+    Discord.GatewayIntentBits.GuildMembers,
   ],
   presence: {
     activities: [
@@ -95,11 +104,43 @@ const markovGenerateOptions: MarkovGenerateOptions<MarkovDataCustom> = {
 };
 
 async function refreshCdnUrl(url: string): Promise<string> {
-  // Thank you https://github.com/ShufflePerson/Discord_CDN
+  // Check cache first - URLs are typically valid for 24 hours
+  const now = Date.now();
+  const cached = cdnUrlCache.get(url);
+
+  if (cached && cached.expires > now) {
+    L.trace({ url, cachedUrl: cached.url }, 'Using cached CDN URL');
+    return cached.url;
+  }
+
+  // Cache miss - refresh the URL
+  L.trace({ url }, 'Refreshing CDN URL (cache miss)');
   const resp = (await rest.post(`/attachments/refresh-urls`, {
     body: { attachment_urls: [url] },
   })) as IRefreshUrlsRes;
-  return resp.refreshed_urls[0].refreshed;
+
+  const refreshedUrl = resp.refreshed_urls[0].refreshed;
+
+  // Cache the result for 23 hours (slightly less than 24 to be safe)
+  cdnUrlCache.set(url, { url: refreshedUrl, expires: now + 23 * 60 * 60 * 1000 });
+
+  // Clean up expired cache entries periodically (simple LRU-like behavior)
+  if (cdnUrlCache.size > 1000) {
+    const entries = Array.from(cdnUrlCache.entries());
+    const expiredEntries = entries.filter(([_, value]) => value.expires <= now);
+    expiredEntries.forEach(([key]) => cdnUrlCache.delete(key));
+
+    // If still too large, remove oldest entries
+    if (cdnUrlCache.size > 500) {
+      const sortedByTime = entries
+        .filter(([key]) => cdnUrlCache.has(key)) // Only non-expired entries
+        .sort((a, b) => a[1].expires - b[1].expires);
+      const toRemove = sortedByTime.slice(0, 250);
+      toRemove.forEach(([key]) => cdnUrlCache.delete(key));
+    }
+  }
+
+  return refreshedUrl;
 }
 
 async function getMarkovByGuildId(guildId: string): Promise<Markov> {
@@ -150,14 +191,20 @@ async function getAutoRespondChannels(guild: Discord.Guild): Promise<Discord.Tex
   return channels;
 }
 
-async function addAutoRespondChannels(channels: Discord.TextChannel[], guildId: string): Promise<void> {
+async function addAutoRespondChannels(
+  channels: Discord.TextChannel[],
+  guildId: string,
+): Promise<void> {
   const dbChannels = channels.map((c) => {
     return Channel.create({ id: c.id, guild: Guild.create({ id: guildId }), autoRespond: true });
   });
   await Channel.save(dbChannels);
 }
 
-async function removeAutoRespondChannels(channels: Discord.TextChannel[], guildId: string): Promise<void> {
+async function removeAutoRespondChannels(
+  channels: Discord.TextChannel[],
+  guildId: string,
+): Promise<void> {
   const dbChannels = channels.map((c) => {
     return Channel.create({ id: c.id, guild: Guild.create({ id: guildId }), autoRespond: false });
   });
@@ -214,7 +261,7 @@ async function getTextChannels(guild: Discord.Guild): Promise<SelectMenuChannel[
       id: c.id,
       listen: false,
       autoRespond: false,
-      name: textChannels.find((t) => t.id === c.id)?.name
+      name: textChannels.find((t) => t.id === c.id)?.name,
     }));
   const limitedDbChannels = foundDbChannelsWithName
     .concat(notFoundDbChannels)
@@ -331,20 +378,15 @@ function messageToData(message: Discord.Message): AddDataProps {
   };
 }
 
-/**
- * Recursively gets all messages in a text channel's history.
- */
-import { TrainingStateManager } from './training-state';
-
 async function saveGuildMessageHistory(
   interaction: Discord.Message | Discord.CommandInteraction,
   clean = true,
 ): Promise<string> {
   if (!isModerator(interaction.member)) return INVALID_PERMISSIONS_MESSAGE;
   if (!interaction.guildId || !interaction.guild) return INVALID_GUILD_MESSAGE;
-  
+
   const stateManager = new TrainingStateManager(interaction.guildId, CONFIG_DIR);
-  
+
   // Check if training is already in progress
   const currentState = stateManager.getState();
   if (currentState.inProgress) {
@@ -367,7 +409,7 @@ async function saveGuildMessageHistory(
     L.debug('Not deleting old data during training');
     // Filter out already processed channels when not cleaning
     const unprocessedChannels = channels.filter(
-      channel => !stateManager.isChannelProcessed(channel.id)
+      (channel) => !stateManager.isChannelProcessed(channel.id),
     );
     if (unprocessedChannels.length === 0) {
       return 'All channels have been processed. Use clean=true to retrain.';
@@ -416,12 +458,13 @@ async function saveGuildMessageHistory(
     progressMessage = (await interaction.followUp(updateMessageData)) as Discord.Message;
   }
 
-  const PAGE_SIZE = 50; // Reduced page size for better stability
-  const UPDATE_RATE = 500; // More frequent updates
-  const BATCH_SIZE = 100; // Number of messages to process before a small delay
-  const BATCH_DELAY = 100; // Milliseconds to wait between batches
+  const PAGE_SIZE = 200; // Increased from 50 to 200 for fewer API calls
+  const UPDATE_RATE = 1000; // Less frequent updates for large datasets
+  const BATCH_SIZE = 500; // Increased from 100 to 500 for better DB performance
+  const BATCH_DELAY = 50; // Reduced delay since batches are larger
   const MAX_MEMORY_USAGE = 1024 * 1024 * 1024; // 1GB memory limit
-  
+  const MEMORY_CHECK_INTERVAL = 10; // Check memory every N batches instead of every batch
+
   let lastUpdate = 0;
   let messagesCount = 0;
   let firstMessageDate: number | undefined;
@@ -433,17 +476,17 @@ async function saveGuildMessageHistory(
     return used.heapUsed;
   };
 
-// Add delay between batches
-const processingDelay = () => new Promise(resolve => setTimeout(resolve, BATCH_DELAY));
+  // Add delay between batches
+  const processingDelay = () => new Promise((resolve) => setTimeout(resolve, BATCH_DELAY));
 
-try {
+  try {
     // eslint-disable-next-line no-restricted-syntax
     for (const channel of channels) {
-    try {
+      try {
         // Check if we should skip this channel (already processed)
         if (stateManager.isChannelProcessed(channel.id)) {
-        L.debug({ channelId: channel.id }, 'Skipping already processed channel');
-        continue;
+          L.debug({ channelId: channel.id }, 'Skipping already processed channel');
+          continue;
         }
         let keepGoing = true;
         let oldestMessageID = stateManager.shouldResumeFromMessage(channel.id);
@@ -452,175 +495,181 @@ try {
         const channelEta = makeEta({ autostart: true, min: 0, max: 1, historyTimeConstant: 30 });
 
         while (keepGoing) {
-      let allBatchMessages = new Discord.Collection<string, Discord.Message<boolean>>();
-      let channelBatchMessages: Discord.Collection<string, Discord.Message<boolean>>;
-      try {
-        // eslint-disable-next-line no-await-in-loop
-        channelBatchMessages = await channel.messages.fetch({
-          before: oldestMessageID,
-          limit: PAGE_SIZE,
-        });
-      } catch (err) {
-        L.error(err);
-        L.error(
-          `Error retreiving messages before ${oldestMessageID} in channel ${channel.name}. This is probably a permissions issue.`,
-        );
-        break; // Give up on this channel
-      }
-
-      // Gather any thread messages if present in this message batch
-      const threadChannels = channelBatchMessages
-        .filter((m) => m.hasThread)
-        .map((m) => m.thread)
-        .filter((c): c is Discord.AnyThreadChannel => c !== null);
-      if (threadChannels.length > 0) {
-        L.debug(`Found ${threadChannels.length} threads. Reading into them.`);
-        // eslint-disable-next-line no-restricted-syntax
-        for (const threadChannel of threadChannels) {
-          let oldestThreadMessageID: string | undefined;
-          let keepGoingThread = true;
-          L.debug({ channelId: threadChannel.id }, `Training from thread`);
-
-          while (keepGoingThread) {
-            let threadBatchMessages: Discord.Collection<string, Discord.Message<boolean>>;
-            try {
-              // eslint-disable-next-line no-await-in-loop
-              threadBatchMessages = await threadChannel.messages.fetch({
-                before: oldestThreadMessageID,
-                limit: PAGE_SIZE,
-              });
-            } catch (err) {
-              L.error(err);
-              L.error(
-                `Error retreiving thread messages before ${oldestThreadMessageID} in thread ${threadChannel.name}. This is probably a permissions issue.`,
-              );
-              break; // Give up on this thread
-            }
-            L.trace(
-              { threadMessagesCount: threadBatchMessages.size },
-              `Found some thread messages`,
-            );
-            const lastThreadMessage = threadBatchMessages.last();
-            allBatchMessages = allBatchMessages.concat(threadBatchMessages); // Add the thread messages to this message batch to be included in later processing
-            if (!lastThreadMessage?.id || threadBatchMessages.size < PAGE_SIZE) {
-              keepGoingThread = false;
-            } else {
-              oldestThreadMessageID = lastThreadMessage.id;
-            }
-          }
-        }
-      }
-
-      allBatchMessages = allBatchMessages.concat(channelBatchMessages);
-
-      try {
-        // Check memory usage before processing
-        const memoryUsage = getMemoryUsage();
-        if (memoryUsage > MAX_MEMORY_USAGE) {
-          L.warn('Memory usage too high, waiting for garbage collection');
-          await processingDelay();
-          global.gc?.(); // Optional garbage collection if --expose-gc flag is used
-        }
-
-        // Filter and data map messages to be ready for addition to the corpus
-        const humanAuthoredMessages = allBatchMessages
-          .filter((m) => isHumanAuthoredMessage(m))
-          .map(messageToData);
-
-        // Process messages in smaller batches for stability
-        for (let i = 0; i < humanAuthoredMessages.length; i += BATCH_SIZE) {
-          const batch = humanAuthoredMessages.slice(i, i + BATCH_SIZE);
-          L.trace({ oldestMessageID, batchSize: batch.length }, `Saving batch of messages`);
-          
+          let allBatchMessages = new Discord.Collection<string, Discord.Message<boolean>>();
+          let channelBatchMessages: Discord.Collection<string, Discord.Message<boolean>>;
           try {
             // eslint-disable-next-line no-await-in-loop
-            await markov.addData(batch);
-            batchCount++;
-            messagesCount += batch.length;
-
-            // Update state after successful batch
-            const lastMessage = allBatchMessages.last();
-            if (lastMessage) {
-              stateManager.updateProgress(channel.id, lastMessage.id, messagesCount);
-            }
-
-            // Add delay between batches
-            if (batchCount % 5 === 0) { // Every 5 batches
-              await processingDelay();
-            }
+            channelBatchMessages = await channel.messages.fetch({
+              before: oldestMessageID,
+              limit: PAGE_SIZE,
+            });
           } catch (err) {
-            stateManager.recordError(err as Error, channel.id, oldestMessageID);
-            L.error({ err, batchSize: batch.length }, 'Error saving batch of messages');
-            // Continue with next batch instead of failing completely
-            continue;
+            L.error(err);
+            L.error(
+              `Error retreiving messages before ${oldestMessageID} in channel ${channel.name}. This is probably a permissions issue.`,
+            );
+            break; // Give up on this channel
+          }
+
+          // Gather any thread messages if present in this message batch
+          const threadChannels = channelBatchMessages
+            .filter((m) => m.hasThread)
+            .map((m) => m.thread)
+            .filter((c): c is Discord.AnyThreadChannel => c !== null);
+          if (threadChannels.length > 0) {
+            L.debug(`Found ${threadChannels.length} threads. Reading into them.`);
+            // eslint-disable-next-line no-restricted-syntax
+            for (const threadChannel of threadChannels) {
+              let oldestThreadMessageID: string | undefined;
+              let keepGoingThread = true;
+              L.debug({ channelId: threadChannel.id }, `Training from thread`);
+
+              while (keepGoingThread) {
+                let threadBatchMessages: Discord.Collection<string, Discord.Message<boolean>>;
+                try {
+                  // eslint-disable-next-line no-await-in-loop
+                  threadBatchMessages = await threadChannel.messages.fetch({
+                    before: oldestThreadMessageID,
+                    limit: PAGE_SIZE,
+                  });
+                } catch (err) {
+                  L.error(err);
+                  L.error(
+                    `Error retreiving thread messages before ${oldestThreadMessageID} in thread ${threadChannel.name}. This is probably a permissions issue.`,
+                  );
+                  break; // Give up on this thread
+                }
+                L.trace(
+                  { threadMessagesCount: threadBatchMessages.size },
+                  `Found some thread messages`,
+                );
+                const lastThreadMessage = threadBatchMessages.last();
+                allBatchMessages = allBatchMessages.concat(threadBatchMessages); // Add the thread messages to this message batch to be included in later processing
+                if (!lastThreadMessage?.id || threadBatchMessages.size < PAGE_SIZE) {
+                  keepGoingThread = false;
+                } else {
+                  oldestThreadMessageID = lastThreadMessage.id;
+                }
+              }
+            }
+          }
+
+          allBatchMessages = allBatchMessages.concat(channelBatchMessages);
+
+          try {
+            // Check memory usage less frequently for better performance
+            if (batchCount % MEMORY_CHECK_INTERVAL === 0) {
+              const memoryUsage = getMemoryUsage();
+              if (memoryUsage > MAX_MEMORY_USAGE) {
+                L.warn('Memory usage too high, waiting for garbage collection');
+                await processingDelay();
+                global.gc?.(); // Optional garbage collection if --expose-gc flag is used
+              }
+            }
+
+            // Filter and data map messages to be ready for addition to the corpus
+            const humanAuthoredMessages = allBatchMessages
+              .filter((m) => isHumanAuthoredMessage(m))
+              .map(messageToData);
+
+            // Process messages in smaller batches for stability
+            for (let i = 0; i < humanAuthoredMessages.length; i += BATCH_SIZE) {
+              const batch = humanAuthoredMessages.slice(i, i + BATCH_SIZE);
+              L.trace({ oldestMessageID, batchSize: batch.length }, `Saving batch of messages`);
+
+              try {
+                // eslint-disable-next-line no-await-in-loop
+                await markov.addData(batch);
+                batchCount++;
+                messagesCount += batch.length;
+
+                // Update state after successful batch
+                const lastMessage = allBatchMessages.last();
+                if (lastMessage) {
+                  stateManager.updateProgress(channel.id, lastMessage.id, messagesCount);
+                }
+
+                // Add delay between batches less frequently due to larger batches
+                if (batchCount % 3 === 0) {
+                  // Every 3 large batches
+                  await processingDelay();
+                }
+              } catch (err) {
+                stateManager.recordError(err as Error, channel.id, oldestMessageID);
+                L.error({ err, batchSize: batch.length }, 'Error saving batch of messages');
+                // Continue with next batch instead of failing completely
+                continue;
+              }
+            }
+
+            L.trace('Finished processing message batches');
+          } catch (err) {
+            L.error({ err }, 'Error processing messages');
+            // Wait a bit before continuing to next batch of messages
+            await processingDelay();
+          }
+          const lastMessage = channelBatchMessages.last();
+
+          // Update tracking metrics
+          if (!lastMessage?.id || channelBatchMessages.size < PAGE_SIZE) {
+            keepGoing = false;
+            const channelIdListItem = ` • <#${channel.id}>`;
+            if (completedChannelsField.value === NO_COMPLETED_CHANNELS_TEXT)
+              completedChannelsField.value = channelIdListItem;
+            else {
+              completedChannelsField.value += `\n${channelIdListItem}`;
+            }
+          } else {
+            oldestMessageID = lastMessage.id;
+          }
+          currentChannelField.value = `<#${channel.id}>`;
+          if (!firstMessageDate) firstMessageDate = channelBatchMessages.first()?.createdTimestamp;
+          const oldestMessageDate = lastMessage?.createdTimestamp;
+          if (firstMessageDate && oldestMessageDate) {
+            const channelAge = firstMessageDate - channelCreateDate;
+            const lastMessageAge = firstMessageDate - oldestMessageDate;
+            const pctComplete = lastMessageAge / channelAge;
+            currentChannelPercent.value = `${(pctComplete * 100).toFixed(2)}%`;
+            channelEta.report(pctComplete);
+            const estimateSeconds = channelEta.estimate();
+            if (Number.isFinite(estimateSeconds))
+              currentChannelEta.value = formatDistanceToNow(
+                addSeconds(new Date(), estimateSeconds),
+                {
+                  includeSeconds: true,
+                },
+              );
+          }
+
+          if (messagesCount > lastUpdate + UPDATE_RATE) {
+            lastUpdate = messagesCount;
+            L.debug(
+              { messagesCount, pctComplete: currentChannelPercent.value },
+              'Sending metrics update',
+            );
+            // eslint-disable-next-line no-await-in-loop
+            await progressMessage.edit({
+              ...updateMessageData,
+              embeds: [new Discord.EmbedBuilder(embedOptions)],
+            });
           }
         }
-        
-        L.trace('Finished processing message batches');
       } catch (err) {
-        L.error({ err }, 'Error processing messages');
-        // Wait a bit before continuing to next batch of messages
-        await processingDelay();
+        L.error({ err }, 'Error processing channel');
+        stateManager.recordError(err as Error);
+        // Continue with next channel
       }
-      const lastMessage = channelBatchMessages.last();
-
-      // Update tracking metrics
-      if (!lastMessage?.id || channelBatchMessages.size < PAGE_SIZE) {
-        keepGoing = false;
-        const channelIdListItem = ` • <#${channel.id}>`;
-        if (completedChannelsField.value === NO_COMPLETED_CHANNELS_TEXT)
-          completedChannelsField.value = channelIdListItem;
-        else {
-          completedChannelsField.value += `\n${channelIdListItem}`;
-        }
-      } else {
-        oldestMessageID = lastMessage.id;
-      }
-      currentChannelField.value = `<#${channel.id}>`;
-      if (!firstMessageDate) firstMessageDate = channelBatchMessages.first()?.createdTimestamp;
-      const oldestMessageDate = lastMessage?.createdTimestamp;
-      if (firstMessageDate && oldestMessageDate) {
-        const channelAge = firstMessageDate - channelCreateDate;
-        const lastMessageAge = firstMessageDate - oldestMessageDate;
-        const pctComplete = lastMessageAge / channelAge;
-        currentChannelPercent.value = `${(pctComplete * 100).toFixed(2)}%`;
-        channelEta.report(pctComplete);
-        const estimateSeconds = channelEta.estimate();
-        if (Number.isFinite(estimateSeconds))
-          currentChannelEta.value = formatDistanceToNow(addSeconds(new Date(), estimateSeconds), {
-            includeSeconds: true,
-          });
-      }
-
-      if (messagesCount > lastUpdate + UPDATE_RATE) {
-        lastUpdate = messagesCount;
-        L.debug(
-          { messagesCount, pctComplete: currentChannelPercent.value },
-          'Sending metrics update',
-        );
-        // eslint-disable-next-line no-await-in-loop
-        await progressMessage.edit({
-          ...updateMessageData,
-          embeds: [new Discord.EmbedBuilder(embedOptions)],
-        });
     }
-    }
-} catch (err) {
-L.error({ err }, 'Error processing channel');
-stateManager.recordError(err as Error);
-// Continue with next channel
-}
-}
 
-L.info({ channelIds }, `Trained from ${messagesCount} past human authored messages.`);
-stateManager.finishTraining();
-return `Trained from ${messagesCount} past human authored messages.`;
-} catch (err) {
-const error = err as Error;
-L.error({ err }, 'Error during training completion');
-stateManager.recordError(error);
-return `Training encountered an error: ${error.message}. Use clean=false to resume from last checkpoint.`;
-}
+    L.info({ channelIds }, `Trained from ${messagesCount} past human authored messages.`);
+    stateManager.finishTraining();
+    return `Trained from ${messagesCount} past human authored messages.`;
+  } catch (err) {
+    const error = err as Error;
+    L.error({ err }, 'Error during training completion');
+    stateManager.recordError(error);
+    return `Training encountered an error: ${error.message}. Use clean=false to resume from last checkpoint.`;
+  }
 }
 
 interface JSONImport {
@@ -639,9 +688,9 @@ async function trainFromAttachmentJson(
   if (!isModerator(interaction.member)) return INVALID_PERMISSIONS_MESSAGE;
   if (!interaction.guildId || !interaction.guild) return INVALID_GUILD_MESSAGE;
   const { guildId } = interaction;
-  
+
   const stateManager = new TrainingStateManager(guildId, CONFIG_DIR);
-  
+
   // Check if training is already in progress
   const currentState = stateManager.getState();
   if (currentState.inProgress) {
@@ -690,8 +739,9 @@ async function trainFromAttachmentJson(
     L.debug('Not deleting old data during training');
   }
 
-  const BATCH_SIZE = 100;
-  const BATCH_DELAY = 100;
+  const BATCH_SIZE = 2000; // Increased from 100 to 2000 for better DB performance
+  const BATCH_DELAY = 50; // Reduced delay since batches are larger
+  const MEMORY_CHECK_INTERVAL = 10; // Check memory every N batches
   let processedCount = 0;
   let batchCount = 0;
 
@@ -709,7 +759,7 @@ async function trainFromAttachmentJson(
 
         // Add delay between batches
         if (batchCount % 5 === 0) {
-          await new Promise(resolve => setTimeout(resolve, BATCH_DELAY));
+          await new Promise((resolve) => setTimeout(resolve, BATCH_DELAY));
         }
       } catch (err) {
         L.error({ err, batchIndex: i }, 'Error processing JSON batch');
@@ -780,12 +830,25 @@ async function generateResponse(
       const refreshedUrl = await refreshCdnUrl(randomRefAttachment);
       messageOpts.files = [refreshedUrl];
     } else {
+      // Efficient random selection - avoid expensive ORDER BY RANDOM()
+      const totalCount = await MarkovInputData.createQueryBuilder<
+        MarkovInputData<MarkovDataCustom>
+      >('input')
+        .leftJoinAndSelect('input.markov', 'markov')
+        .where({ markov: markov.db })
+        .getCount();
+
+      if (totalCount === 0) {
+        return { message: messageOpts }; // No data available
+      }
+
+      const randomOffset = Math.floor(Math.random() * totalCount);
       const randomMessage = await MarkovInputData.createQueryBuilder<
         MarkovInputData<MarkovDataCustom>
       >('input')
         .leftJoinAndSelect('input.markov', 'markov')
         .where({ markov: markov.db })
-        .orderBy('RANDOM()')
+        .offset(randomOffset)
         .limit(1)
         .getOne();
       const randomMessageAttachmentUrls = randomMessage?.custom?.attachments;
@@ -894,12 +957,7 @@ function helpMessage(): AgnosticReplyOptions {
 function generateInviteUrl(): string {
   return client.generateInvite({
     scopes: [Discord.OAuth2Scopes.Bot, Discord.OAuth2Scopes.ApplicationsCommands],
-    permissions: [
-    'ViewChannel',
-    'SendMessages',
-    'AttachFiles',
-    'ReadMessageHistory'
-  ],
+    permissions: ['ViewChannel', 'SendMessages', 'AttachFiles', 'ReadMessageHistory'],
   });
 }
 
@@ -940,7 +998,7 @@ async function handleNoGuild(
   await interaction.followUp({ content: INVALID_GUILD_MESSAGE, ephemeral: true });
 }
 
-client.on('ready', async (readyClient) => {
+client.on('clientReady', async (readyClient) => {
   L.info({ inviteUrl: generateInviteUrl() }, 'Bot logged in');
 
   await deployCommands(readyClient.user.id);
@@ -998,11 +1056,14 @@ client.on('messageCreate', async (message) => {
     if (isHumanAuthoredMessage(message)) {
       if (client.user && message.mentions.has(client.user)) {
         // Check if response channels are configured and if this channel is allowed
-        if (config.responseChannelIds.length > 0 && !config.responseChannelIds.includes(message.channel.id)) {
+        if (
+          config.responseChannelIds.length > 0 &&
+          !config.responseChannelIds.includes(message.channel.id)
+        ) {
           L.debug('Ignoring mention in non-response channel');
           return;
         }
-        
+
         L.debug('Responding to mention');
         // <@!278354154563567636> how are you doing?
         const startSeed = message.content.replace(/<@!\d+>/g, '').trim();
@@ -1054,7 +1115,6 @@ client.on('threadDelete', async (thread) => {
   const markov = await getMarkovByGuildId(thread.guildId);
   await markov.removeTags([thread.id]);
 });
-
 
 client.on('interactionCreate', async (interaction) => {
   if (interaction.isChatInputCommand()) {
@@ -1141,8 +1201,12 @@ client.on('interactionCreate', async (interaction) => {
       }
     } else if (interaction.commandName === autoRespondCommand.name) {
       await interaction.deferReply();
-      const subCommand = interaction.options.getSubcommand(true) as 'add' | 'remove' | 'list' | 'modify';
-      
+      const subCommand = interaction.options.getSubcommand(true) as
+        | 'add'
+        | 'remove'
+        | 'list'
+        | 'modify';
+
       if (subCommand === 'list') {
         const reply = await listAutoRespondChannels(interaction);
         await interaction.editReply(reply);
@@ -1155,9 +1219,7 @@ client.on('interactionCreate', async (interaction) => {
         }
         const channels = getChannelsFromInteraction(interaction);
         await addAutoRespondChannels(channels, interaction.guildId);
-        await interaction.editReply(
-          `Added ${channels.length} text channels to auto-respond list.`
-        );
+        await interaction.editReply(`Added ${channels.length} text channels to auto-respond list.`);
       } else if (subCommand === 'remove') {
         if (!isModerator(interaction.member)) {
           return handleUnprivileged(interaction);
@@ -1168,7 +1230,7 @@ client.on('interactionCreate', async (interaction) => {
         const channels = getChannelsFromInteraction(interaction);
         await removeAutoRespondChannels(channels, interaction.guildId);
         await interaction.editReply(
-          `Removed ${channels.length} text channels from auto-respond list.`
+          `Removed ${channels.length} text channels from auto-respond list.`,
         );
       } else if (subCommand === 'modify') {
         if (!interaction.guild) {

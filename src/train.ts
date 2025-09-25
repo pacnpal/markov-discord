@@ -2,8 +2,11 @@ import 'source-map-support/register';
 import 'reflect-metadata';
 import Markov, { MarkovConstructorOptions, AddDataProps } from 'markov-strings-db';
 import { DataSource } from 'typeorm';
-import { promises as fs } from 'fs';
+import fs from 'fs';
+import { promises as fsPromises } from 'fs';
 import path from 'path';
+import { parser } from 'stream-json';
+import { streamArray } from 'stream-json/streamers/StreamArray';
 import { config } from './config';
 import ormconfig from './ormconfig';
 import { Guild } from './entity/Guild';
@@ -17,10 +20,11 @@ const markovOpts: MarkovConstructorOptions = {
   stateSize: config.stateSize,
 };
 
-// Constants for batch processing
-const BATCH_SIZE = 100; // Process messages in batches
-const BATCH_DELAY = 100; // Milliseconds to wait between batches
+// Constants for batch processing - OPTIMIZED for large datasets
+const BATCH_SIZE = 2000; // Increased from 100 to 2000 for better DB performance
+const BATCH_DELAY = 50; // Reduced delay since batches are larger
 const MAX_MEMORY_USAGE = 1024 * 1024 * 1024; // 1GB memory limit
+const MEMORY_CHECK_INTERVAL = 10; // Check memory every N batches instead of every batch
 
 // Monitor memory usage
 const getMemoryUsage = () => {
@@ -29,7 +33,7 @@ const getMemoryUsage = () => {
 };
 
 // Add delay between batches
-const processingDelay = () => new Promise(resolve => setTimeout(resolve, BATCH_DELAY));
+const processingDelay = () => new Promise((resolve) => setTimeout(resolve, BATCH_DELAY));
 
 async function getMarkovByGuildId(guildId: string): Promise<Markov> {
   const markov = new Markov({ id: guildId, options: { ...markovOpts, id: guildId } });
@@ -47,17 +51,22 @@ interface JSONImport {
  * Train from a JSON file containing messages
  */
 
-async function trainFromJson(
-  guildId: string,
-  jsonPath: string,
-  clean = true,
-): Promise<string> {
+async function trainFromJson(guildId: string, jsonPath: string, clean = true): Promise<string> {
   const markov = await getMarkovByGuildId(guildId);
 
   let trainingData: AddDataProps[];
   try {
-    const fileContent = await fs.readFile(jsonPath, 'utf-8');
-    const importData = JSON.parse(fileContent) as JSONImport[];
+    // Use streaming JSON processing for better memory efficiency with large files
+    const pipeline = fs.createReadStream(jsonPath)
+      .pipe(parser())
+      .pipe(streamArray());
+
+    const importData: JSONImport[] = [];
+
+    // Collect all data from stream
+    for await (const { value } of pipeline) {
+      importData.push(value as JSONImport);
+    }
 
     // Filter out invalid entries first
     const validData = importData.filter((datum, index) => {
@@ -65,7 +74,7 @@ async function trainFromJson(
         L.debug({ index }, 'Skipping entry without valid message');
         return false;
       }
-      if (datum.attachments?.some(a => typeof a !== 'string')) {
+      if (datum.attachments?.some((a) => typeof a !== 'string')) {
         L.debug({ index }, 'Skipping entry with invalid attachments');
         return false;
       }
@@ -73,7 +82,7 @@ async function trainFromJson(
     });
 
     // Map valid entries to training data
-    trainingData = validData.map(datum => {
+    trainingData = validData.map((datum) => {
       let custom: MarkovDataCustom | undefined;
       if (datum.attachments?.length) {
         custom = { attachments: datum.attachments };
@@ -81,7 +90,7 @@ async function trainFromJson(
       return {
         string: datum.message,
         custom,
-        tags: [guildId]
+        tags: [guildId],
       };
     });
   } catch (err) {
@@ -106,25 +115,27 @@ async function trainFromJson(
   // Process messages in batches
   for (let i = 0; i < trainingData.length; i += BATCH_SIZE) {
     try {
-      // Check memory usage
-      const memoryUsage = getMemoryUsage();
-      if (memoryUsage > MAX_MEMORY_USAGE) {
-        L.warn('Memory usage too high, waiting for garbage collection');
-        await processingDelay();
-        global.gc?.(); // Optional garbage collection if --expose-gc flag is used
+      // Check memory usage less frequently for better performance
+      if (batchCount % MEMORY_CHECK_INTERVAL === 0) {
+        const memoryUsage = getMemoryUsage();
+        if (memoryUsage > MAX_MEMORY_USAGE) {
+          L.warn('Memory usage too high, waiting for garbage collection');
+          await processingDelay();
+          global.gc?.(); // Optional garbage collection if --expose-gc flag is used
+        }
       }
 
       const batch = trainingData.slice(i, i + BATCH_SIZE);
       await markov.addData(batch);
-      
+
       processedCount += batch.length;
       batchCount++;
 
-      // Log progress
-      if (batchCount % 5 === 0) {
-        const progress = (processedCount / totalMessages * 100).toFixed(2);
+      // Log progress less frequently due to larger batches
+      if (batchCount % 2 === 0) {
+        const progress = ((processedCount / totalMessages) * 100).toFixed(2);
         L.info(`Progress: ${progress}% (${processedCount}/${totalMessages} messages)`);
-        await processingDelay(); // Add delay every 5 batches
+        await processingDelay(); // Add delay every 2 large batches
       }
     } catch (err) {
       L.error({ err, batchIndex: i }, 'Error processing batch');
@@ -153,20 +164,20 @@ async function trainFromJson(
 async function acquireTrainingLock(guildId: string): Promise<boolean> {
   const lockPath = path.join(CONFIG_DIR, `${guildId}_training.lock`);
   try {
-    await fs.writeFile(lockPath, process.pid.toString(), { flag: 'wx' });
+    await fsPromises.writeFile(lockPath, process.pid.toString(), { flag: 'wx' });
     return true;
   } catch (err) {
     if ((err as NodeJS.ErrnoException).code === 'EEXIST') {
       try {
-        const pid = parseInt(await fs.readFile(lockPath, 'utf-8'));
+        const pid = parseInt(await fsPromises.readFile(lockPath, 'utf-8'));
         try {
           // Check if process is still running
           process.kill(pid, 0);
           return false; // Process is still running
         } catch {
           // Process is not running, safe to remove lock
-          await fs.unlink(lockPath);
-          await fs.writeFile(lockPath, process.pid.toString());
+          await fsPromises.unlink(lockPath);
+          await fsPromises.writeFile(lockPath, process.pid.toString());
           return true;
         }
       } catch {
@@ -184,7 +195,7 @@ async function acquireTrainingLock(guildId: string): Promise<boolean> {
 async function releaseTrainingLock(guildId: string): Promise<void> {
   const lockPath = path.join(CONFIG_DIR, `${guildId}_training.lock`);
   try {
-    await fs.unlink(lockPath);
+    await fsPromises.unlink(lockPath);
   } catch {
     // Ignore errors during cleanup
   }
@@ -196,23 +207,25 @@ async function releaseTrainingLock(guildId: string): Promise<void> {
 async function validateDirectoryPath(dirPath: string): Promise<string> {
   // Resolve to absolute path
   const absolutePath = path.resolve(dirPath);
-  
+
   // Prevent directory traversal
   const normalizedPath = path.normalize(absolutePath);
   if (!normalizedPath.startsWith(process.cwd())) {
     throw new Error('Directory must be within current working directory');
   }
-  
+
   // Verify directory exists and is accessible
   try {
-    const stats = await fs.stat(normalizedPath);
+    const stats = await fsPromises.stat(normalizedPath);
     if (!stats.isDirectory()) {
       throw new Error('Path is not a directory');
     }
-    await fs.access(normalizedPath, fs.constants.R_OK);
+    await fsPromises.access(normalizedPath, fsPromises.constants.R_OK);
     return normalizedPath;
   } catch (err) {
-    throw new Error(`Invalid directory path: ${err instanceof Error ? err.message : 'Unknown error'}`);
+    throw new Error(
+      `Invalid directory path: ${err instanceof Error ? err.message : 'Unknown error'}`,
+    );
   }
 }
 
@@ -244,7 +257,7 @@ async function trainFromDirectory(
 
   try {
     // Try to acquire lock
-    if (!await acquireTrainingLock(guildId)) {
+    if (!(await acquireTrainingLock(guildId))) {
       return 'Another training process is already running. Please wait for it to complete.';
     }
 
@@ -254,12 +267,12 @@ async function trainFromDirectory(
     try {
       // Validate and normalize directory path
       const absolutePath = await validateDirectoryPath(dirPath);
-      
+
       // Get all JSON files in the directory
       L.trace({ dirPath: absolutePath }, 'Reading directory');
-      const files = await fs.readdir(absolutePath);
-      const jsonFiles = files.filter(file => file.toLowerCase().endsWith('.json'));
-      
+      const files = await fsPromises.readdir(absolutePath);
+      const jsonFiles = files.filter((file: string) => file.toLowerCase().endsWith('.json'));
+
       if (jsonFiles.length === 0) {
         L.warn({ dirPath: absolutePath }, 'No JSON files found in directory');
         return 'No JSON files found in the specified directory.';
@@ -278,19 +291,22 @@ async function trainFromDirectory(
         // Log progress to console
         console.log(`\nProcessing file ${fileNumber}/${jsonFiles.length}: ${jsonFiles[i]}`);
         console.log(`${jsonFiles.length - fileNumber} files remaining\n`);
-        
+
         L.debug(
           { file: jsonFiles[i], progress: `${fileNumber}/${jsonFiles.length}` },
-          'Processing file'
+          'Processing file',
         );
-        
+
         try {
-          // Check memory usage before processing file
-          const memoryUsage = getMemoryUsage();
-          if (memoryUsage > MAX_MEMORY_USAGE) {
-            L.warn('Memory usage too high, waiting for garbage collection');
-            await processingDelay();
-            global.gc?.(); // Optional garbage collection if --expose-gc flag is used
+          // Check memory usage less frequently during file processing
+          if (fileNumber % 3 === 0) {
+            // Check every 3rd file
+            const memoryUsage = getMemoryUsage();
+            if (memoryUsage > MAX_MEMORY_USAGE) {
+              L.warn('Memory usage too high, waiting for garbage collection');
+              await processingDelay();
+              global.gc?.(); // Optional garbage collection if --expose-gc flag is used
+            }
           }
 
           // Check if file was already processed
@@ -308,9 +324,9 @@ async function trainFromDirectory(
           const result = await trainFromJson(
             guildId,
             jsonPath,
-            i === 0 ? clean : false // Only clean on first file
+            i === 0 ? clean : false, // Only clean on first file
           );
-          
+
           // Extract number of processed messages from result string
           const processed = parseInt(result.match(/\d+/)?.[0] || '0');
           totalProcessed += processed;
@@ -318,13 +334,10 @@ async function trainFromDirectory(
 
           // Update state after each file
           stateManager.updateProgress('json-import', jsonFiles[i], totalProcessed);
-          L.trace(
-            { file: jsonFiles[i], processed, totalProcessed },
-            'File processing complete'
-          );
+          L.trace({ file: jsonFiles[i], processed, totalProcessed }, 'File processing complete');
 
-          // Add delay between files
-          if (batchCount % 5 === 0) {
+          // Add delay between files less frequently due to larger batches
+          if (batchCount % 3 === 0) {
             await processingDelay();
           }
 
@@ -336,7 +349,7 @@ async function trainFromDirectory(
           const error = err as Error;
           L.error(
             { error: error.message, file: jsonFiles[i], stack: error.stack },
-            'Error processing JSON file'
+            'Error processing JSON file',
           );
           stateManager.recordError(error, 'json-import', jsonFiles[i]);
           // Add longer delay after error
@@ -360,7 +373,7 @@ async function trainFromDirectory(
     const error = err as Error;
     L.error(
       { error: error.message, stack: error.stack, dirPath },
-      'Error during directory training'
+      'Error during directory training',
     );
     stateManager.recordError(error);
     return `Training encountered an error: ${error.message}. Use clean=false to resume from last checkpoint.`;
@@ -370,7 +383,9 @@ async function trainFromDirectory(
 async function main(): Promise<void> {
   const args = process.argv.slice(2);
   if (args.length < 2) {
-    console.log('Usage: node train.js <guildId> <path> [--keep-existing] [--directory] [--force-retrain]');
+    console.log(
+      'Usage: node train.js <guildId> <path> [--keep-existing] [--directory] [--force-retrain]',
+    );
     console.log('Options:');
     console.log('  --keep-existing  Keep existing training data');
     console.log('  --directory      Process all JSON files in the specified directory');
