@@ -166,7 +166,7 @@ export class WorkerPool extends EventEmitter {
     const task = sortedTasks.shift()!;
 
     this.taskQueue = sortedTasks;
-    this.activeTasks.set(availableWorkerId, task);
+    this.activeTasks.set(String(availableWorkerId), task);
 
     // Send task to worker
     const worker = this.workers[availableWorkerId];
@@ -184,7 +184,7 @@ export class WorkerPool extends EventEmitter {
    */
   private findAvailableWorker(): number {
     for (let i = 0; i < this.maxWorkers; i++) {
-      if (this.workers[i] && !this.activeTasks.has(i)) {
+      if (this.workers[i] && !this.activeTasks.has(String(i))) {
         return i;
       }
     }
@@ -297,7 +297,7 @@ export class WorkerPool extends EventEmitter {
       activeWorkers: this.activeTasks.size,
       queuedTasks: this.taskQueue.length,
       activeTasks: Array.from(this.activeTasks.keys()),
-      availableWorkers: this.workers.filter((w, i) => w && !this.activeTasks.has(i)).length
+      availableWorkers: this.workers.filter((w, i) => w && !this.activeTasks.has(String(i))).length
     };
   }
 
@@ -341,7 +341,7 @@ export class WorkerPool extends EventEmitter {
     for (let i = 0; i < this.maxWorkers; i++) {
       const worker = this.workers[i];
       if (worker) {
-        shutdownPromises.push(worker.terminate());
+        shutdownPromises.push(worker.terminate().then(() => {}));
       }
     }
 

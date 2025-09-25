@@ -73,7 +73,7 @@ export class MarkovStore {
   /**
    * Save chains to serialized storage with debouncing
    */
-  private async save(): Promise<void> {
+public async save(): Promise<void> {
     if (!this.dirty) return;
 
     try {
