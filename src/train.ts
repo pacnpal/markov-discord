@@ -15,6 +15,46 @@ import L from './logger';
 import { MarkovDataCustom } from './types';
 import { TrainingStateManager } from './training-state';
 import { CONFIG_DIR } from './config/setup';
+import { getMarkovStore, MarkovStore } from './markov-store';
+import { getWorkerPool } from './workers/worker-pool';
+
+/**
+ * Determine if a guild should use optimization features
+ * Based on rollout percentage and force-enable lists
+ */
+function shouldUseOptimizations(guildId: string): boolean {
+  // Check force-enable list first
+  if (config.optimizationForceGuildIds.includes(guildId)) {
+    return config.enableMarkovStore;
+  }
+
+  // Check rollout percentage
+  if (config.optimizationRolloutPercentage > 0) {
+    const hash = guildId.split('').reduce((a, b) => {
+      a = ((a << 5) - a) + b.charCodeAt(0);
+      return a & a;
+    }, 0);
+    const percentage = Math.abs(hash) % 100;
+    return percentage < config.optimizationRolloutPercentage && config.enableMarkovStore;
+  }
+
+  return false;
+}
+
+/**
+ * Add training data to MarkovStore
+ */
+async function addDataToMarkovStore(store: MarkovStore, messageData: AddDataProps): Promise<void> {
+  const words = messageData.string.trim().split(/\s+/).filter(word => word.length > 0);
+  
+  // Build chain prefixes (sliding window of stateSize)
+  const stateSize = config.stateSize;
+  for (let i = 0; i < words.length - stateSize; i++) {
+    const prefix = words.slice(i, i + stateSize).join(' ');
+    const suffix = words[i + stateSize];
+    store.addPrefix(prefix, suffix, 1);
+  }
+}
 
 const markovOpts: MarkovConstructorOptions = {
   stateSize: config.stateSize,
@@ -126,7 +166,18 @@ async function trainFromJson(guildId: string, jsonPath: string, clean = true): P
       }
 
       const batch = trainingData.slice(i, i + BATCH_SIZE);
-      await markov.addData(batch);
+      
+      // Use optimized batch training or fallback to traditional
+      if (shouldUseOptimizations(guildId)) {
+        L.debug({ guildId, batchSize: batch.length }, 'Processing training batch with optimized MarkovStore');
+        const store = await getMarkovStore(guildId);
+        for (const messageData of batch) {
+          await addDataToMarkovStore(store, messageData);
+        }
+      } else {
+        L.debug({ guildId, batchSize: batch.length }, 'Processing training batch with traditional Markov');
+        await markov.addData(batch);
+      }
 
       processedCount += batch.length;
       batchCount++;

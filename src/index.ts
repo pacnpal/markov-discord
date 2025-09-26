@@ -8,6 +8,8 @@ import Markov, {
   MarkovConstructorOptions,
   AddDataProps,
 } from 'markov-strings-db';
+import { getMarkovStore, MarkovStore } from './markov-store';
+import { getWorkerPool } from './workers/worker-pool';
 import { DataSource } from 'typeorm';
 import { MarkovInputData } from 'markov-strings-db/dist/src/entity/MarkovInputData';
 import type { PackageJsonPerson } from 'types-package-json';
@@ -143,11 +145,107 @@ async function refreshCdnUrl(url: string): Promise<string> {
   return refreshedUrl;
 }
 
+/**
+ * Determine if a guild should use optimization features
+ * Based on rollout percentage and force-enable lists
+ */
+function shouldUseOptimizations(guildId: string): boolean {
+  // Check force-enable list first
+  if (config.optimizationForceGuildIds.includes(guildId)) {
+    return config.enableMarkovStore;
+  }
+
+  // Check rollout percentage
+  if (config.optimizationRolloutPercentage > 0) {
+    const hash = guildId.split('').reduce((a, b) => {
+      a = ((a << 5) - a) + b.charCodeAt(0);
+      return a & a;
+    }, 0);
+    const percentage = Math.abs(hash) % 100;
+    return percentage < config.optimizationRolloutPercentage && config.enableMarkovStore;
+  }
+
+  return false;
+}
+
+/**
+ * Convert MarkovStore response to markov-strings-db compatible format
+ */
+function adaptMarkovStoreResponse(words: string[], originalMessage?: Discord.Message): any {
+  const responseString = words.join(' ');
+  
+  // Create minimal refs array for compatibility
+  const refs = originalMessage ? [{
+    string: originalMessage.content,
+    refs: [],
+    custom: {
+      attachments: originalMessage.attachments.map(a => a.url),
+      messageId: originalMessage.id,
+      userId: originalMessage.author.id,
+      channelId: originalMessage.channelId
+    }
+  }] : [];
+
+  return {
+    string: responseString,
+    refs: refs,
+    score: words.length // Simple score based on length
+  };
+}
+
+/**
+ * Extract training data from message for MarkovStore
+ */
+function messageToMarkovData(message: Discord.Message): { text: string; custom: any } {
+  const messageData = messageToData(message);
+  return {
+    text: messageData.string,
+    custom: messageData.custom
+  };
+}
+
+/**
+ * Add training data to MarkovStore
+ */
+async function addDataToMarkovStore(store: MarkovStore, messageData: ReturnType<typeof messageToData>): Promise<void> {
+  const words = messageData.string.trim().split(/\s+/).filter(word => word.length > 0);
+  
+  // Build chain prefixes (sliding window of stateSize)
+  const stateSize = config.stateSize;
+  for (let i = 0; i < words.length - stateSize; i++) {
+    const prefix = words.slice(i, i + stateSize).join(' ');
+    const suffix = words[i + stateSize];
+    store.addPrefix(prefix, suffix, 1);
+  }
+}
+
 async function getMarkovByGuildId(guildId: string): Promise<Markov> {
   const markov = new Markov({ id: guildId, options: { ...markovOpts, id: guildId } });
   L.trace({ guildId }, 'Setting up markov instance');
   await markov.setup(); // Connect the markov instance to the DB to assign it an ID
   return markov;
+}
+
+/**
+ * Get optimized MarkovStore or fallback to traditional Markov
+ */
+async function getOptimizedMarkov(guildId: string): Promise<{ store?: MarkovStore; markov?: Markov; useOptimized: boolean }> {
+  const useOptimized = shouldUseOptimizations(guildId);
+  
+  if (useOptimized) {
+    try {
+      const store = await getMarkovStore(guildId);
+      L.debug({ guildId }, 'Using optimized MarkovStore');
+      return { store, useOptimized: true };
+    } catch (err) {
+      L.warn({ err, guildId }, 'Failed to load optimized store, falling back to traditional Markov');
+    }
+  }
+
+  // Fallback to traditional markov-strings-db
+  const markov = await getMarkovByGuildId(guildId);
+  L.debug({ guildId }, 'Using traditional markov-strings-db');
+  return { markov, useOptimized: false };
 }
 
 /**
@@ -578,8 +676,18 @@ async function saveGuildMessageHistory(
               L.trace({ oldestMessageID, batchSize: batch.length }, `Saving batch of messages`);
 
               try {
-                // eslint-disable-next-line no-await-in-loop
-                await markov.addData(batch);
+                // Use optimized batch training or fallback to traditional
+                if (shouldUseOptimizations(interaction.guildId!)) {
+                  L.debug({ guildId: interaction.guildId, batchSize: batch.length }, 'Processing batch with optimized MarkovStore');
+                  const store = await getMarkovStore(interaction.guildId!);
+                  for (const messageData of batch) {
+                    await addDataToMarkovStore(store, messageData);
+                  }
+                } else {
+                  L.debug({ guildId: interaction.guildId, batchSize: batch.length }, 'Processing batch with traditional Markov');
+                  // eslint-disable-next-line no-await-in-loop
+                  await markov.addData(batch);
+                }
                 batchCount++;
                 messagesCount += batch.length;
 
@@ -750,7 +858,17 @@ async function trainFromAttachmentJson(
     for (let i = 0; i < trainingData.length; i += BATCH_SIZE) {
       const batch = trainingData.slice(i, i + BATCH_SIZE);
       try {
-        await markov.addData(batch);
+        // Use optimized batch training or fallback to traditional
+        if (shouldUseOptimizations(guildId)) {
+          L.debug({ guildId, batchSize: batch.length }, 'Processing JSON batch with optimized MarkovStore');
+          const store = await getMarkovStore(guildId);
+          for (const messageData of batch) {
+            await addDataToMarkovStore(store, messageData);
+          }
+        } else {
+          L.debug({ guildId, batchSize: batch.length }, 'Processing JSON batch with traditional Markov');
+          await markov.addData(batch);
+        }
         processedCount += batch.length;
         batchCount++;
 
@@ -812,21 +930,44 @@ async function generateResponse(
     L.info('Member does not have permissions to generate a response');
     return { error: { content: INVALID_PERMISSIONS_MESSAGE } };
   }
-  const markov = await getMarkovByGuildId(interaction.guildId);
+  // Use optimized MarkovStore or fallback to traditional Markov
+  const optimizedMarkov = await getOptimizedMarkov(interaction.guildId);
+  let response: any;
 
   try {
-    markovGenerateOptions.startSeed = startSeed;
-    const response = await markov.generate<MarkovDataCustom>(markovGenerateOptions);
+    const workerPool = getWorkerPool();
+    if (optimizedMarkov.useOptimized && optimizedMarkov.store) {
+      // Use optimized MarkovStore with O(1) alias method sampling
+      L.debug({ guildId: interaction.guildId }, 'Generating response with optimized MarkovStore');
+
+      const maxLength = 100; // Default max length
+      // Offload chain sampling to worker pool
+      const workerResponse = await workerPool.generateResponse(
+        interaction.guildId,
+        startSeed || '',
+        maxLength
+      );
+
+      response = adaptMarkovStoreResponse(workerResponse.response.split(' '));
+
+      L.info({ string: response.string, optimized: true }, 'Generated optimized response text');
+    } else {
+      // Fallback to traditional markov-strings-db
+      L.debug({ guildId: interaction.guildId }, 'Generating response with traditional Markov');
+      markovGenerateOptions.startSeed = startSeed;
+      response = await optimizedMarkov.markov!.generate<MarkovDataCustom>(markovGenerateOptions);
+      L.info({ string: response.string, optimized: false }, 'Generated traditional response text');
+    }
     L.info({ string: response.string }, 'Generated response text');
     L.debug({ response }, 'Generated response object');
     const messageOpts: AgnosticReplyOptions = {
       allowedMentions: { repliedUser: false, parse: [] },
     };
     const attachmentUrls = response.refs
-      .filter((ref) => ref.custom && 'attachments' in ref.custom)
-      .flatMap((ref) => (ref.custom as MarkovDataCustom).attachments);
+      .filter((ref: any) => ref.custom && 'attachments' in ref.custom)
+      .flatMap((ref: any) => (ref.custom as MarkovDataCustom).attachments);
     if (attachmentUrls.length > 0) {
-      const randomRefAttachment = getRandomElement(attachmentUrls);
+      const randomRefAttachment = getRandomElement(attachmentUrls) as string;
       const refreshedUrl = await refreshCdnUrl(randomRefAttachment);
       messageOpts.files = [refreshedUrl];
     } else {
@@ -835,7 +976,7 @@ async function generateResponse(
         MarkovInputData<MarkovDataCustom>
       >('input')
         .leftJoinAndSelect('input.markov', 'markov')
-        .where({ markov: markov.db })
+        .where({ markov: optimizedMarkov.markov!.db })
         .getCount();
 
       if (totalCount === 0) {
@@ -847,7 +988,7 @@ async function generateResponse(
         MarkovInputData<MarkovDataCustom>
       >('input')
         .leftJoinAndSelect('input.markov', 'markov')
-        .where({ markov: markov.db })
+        .where({ markov: optimizedMarkov.markov!.db })
         .offset(randomOffset)
         .limit(1)
         .getOne();
@@ -1022,6 +1163,52 @@ client.on('warn', (m) => L.warn(m));
 client.on('error', (m) => L.error(m));
 
 client.on('messageCreate', async (message) => {
+  // Debug logging for message reception
+  const embedsText = message.embeds.length > 0 ? `[${message.embeds.length} embed(s)]` : '';
+  const componentsText = message.components.length > 0 ? `[${message.components.length} component(s)]` : '';
+  const attachmentsText = message.attachments.size > 0 ? `[${message.attachments.size} attachment(s)]` : '';
+
+  // Log embed content if present
+  let embedContent = '';
+  if (message.embeds.length > 0) {
+    embedContent = message.embeds.map(embed => {
+      if (embed.title) return `Title: ${embed.title}`;
+      if (embed.description) return `Desc: ${embed.description.substring(0, 50)}...`;
+      if (embed.url) return `URL: ${embed.url}`;
+      return '[Embed]';
+    }).join(' | ');
+  }
+
+  // Log component content if present
+  let componentContent = '';
+  if (message.components.length > 0) {
+    componentContent = message.components.map((comp) => {
+      if (comp instanceof Discord.ActionRow && comp.components.length > 0) {
+        return comp.components.map((c: Discord.MessageActionRowComponent) => c.type).join(',');
+      }
+      return '[Component]';
+    }).join(' | ');
+  }
+
+  L.info({
+    messageId: message.id,
+    author: message.author?.username || 'Unknown',
+    authorId: message.author?.id || 'Unknown',
+    channel: message.channel.id,
+    guild: message.guildId || 'DM',
+    contentLength: message.content.length,
+    content: message.content.length > 100 ? message.content.substring(0, 100) + '...' : message.content || '[EMPTY]',
+    embeds: embedsText,
+    embedContent: embedContent || '[No embeds]',
+    components: componentsText,
+    componentContent: componentContent || '[No components]',
+    attachments: attachmentsText,
+    sticker: message.stickers.size > 0 ? 'YES' : 'NO',
+    messageType: message.type || 'DEFAULT',
+    isBot: message.author?.bot || false,
+    isSystem: message.system || false
+  }, 'Message received');
+
   if (
     !(
       message.guild &&
@@ -1079,8 +1266,17 @@ client.on('messageCreate', async (message) => {
 
       if (await isValidChannel(message.channel)) {
         L.debug('Listening');
-        const markov = await getMarkovByGuildId(message.channel.guildId);
-        await markov.addData([messageToData(message)]);
+        // Use optimized training or fallback to traditional
+        if (shouldUseOptimizations(message.channel.guildId)) {
+          L.debug({ guildId: message.channel.guildId }, 'Adding message data with optimized MarkovStore');
+          const store = await getMarkovStore(message.channel.guildId);
+          await addDataToMarkovStore(store, messageToData(message));
+        } else {
+          // Fallback to traditional markov-strings-db
+          L.debug({ guildId: message.channel.guildId }, 'Adding message data with traditional Markov');
+          const markov = await getMarkovByGuildId(message.channel.guildId);
+          await markov.addData([messageToData(message)]);
+        }
       }
     }
   }
@@ -1351,6 +1547,39 @@ async function main(): Promise<void> {
   const dataSourceOptions = Markov.extendDataSourceOptions(ormconfig);
   const dataSource = new DataSource(dataSourceOptions);
   await dataSource.initialize();
+  
+  // Initialize worker pool for CPU offloading if enabled
+  if (config.enableWorkerPool) {
+    L.info({ workerPoolSize: config.workerPoolSize }, 'Initializing worker pool for performance optimization');
+    const workerPool = getWorkerPool(config.workerPoolSize);
+    
+    // Add graceful shutdown handler for worker pool
+    const shutdownHandler = async () => {
+      L.info('Shutting down worker pool...');
+      await workerPool.shutdown();
+      process.exit(0);
+    };
+    
+    process.on('SIGINT', shutdownHandler);
+    process.on('SIGTERM', shutdownHandler);
+  }
+  
+  // Initialize worker pool for CPU offloading if enabled
+  if (config.enableWorkerPool) {
+    L.info({ workerPoolSize: config.workerPoolSize }, 'Initializing worker pool for performance optimization');
+    const workerPool = getWorkerPool(config.workerPoolSize);
+    
+    // Add graceful shutdown handler for worker pool
+    const shutdownHandler = async () => {
+      L.info('Shutting down worker pool...');
+      await workerPool.shutdown();
+      process.exit(0);
+    };
+    
+    process.on('SIGINT', shutdownHandler);
+    process.on('SIGTERM', shutdownHandler);
+  }
+  
   await client.login(config.token);
 }
 

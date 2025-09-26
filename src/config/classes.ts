@@ -9,6 +9,10 @@ import {
   IsInt,
   IsDefined,
   IsNotEmpty,
+  IsBoolean,
+  Min,
+  Max,
+  IsNumber,
 } from 'class-validator';
 
 export enum LogLevel {
@@ -178,4 +182,130 @@ export class AppConfig {
   responseChannelIds = process.env.RESPONSE_CHANNEL_IDS
     ? process.env.RESPONSE_CHANNEL_IDS.split(',').map((id) => id.trim())
     : [];
+
+  // ===== PERFORMANCE OPTIMIZATION SETTINGS =====
+
+  /**
+   * Enable the optimized MarkovStore with O(1) alias method sampling
+   * When enabled, replaces markov-strings-db with serialized chain store
+   * @example true
+   * @default false
+   * @env ENABLE_MARKOV_STORE
+   */
+  @IsOptional()
+  @IsBoolean()
+  enableMarkovStore = process.env.ENABLE_MARKOV_STORE === 'true' || false;
+
+  /**
+   * Enable worker thread pool for CPU-intensive operations
+   * Offloads chain building and generation to background threads
+   * @example true
+   * @default false
+   * @env ENABLE_WORKER_POOL
+   */
+  @IsOptional()
+  @IsBoolean()
+  enableWorkerPool = process.env.ENABLE_WORKER_POOL === 'true' || false;
+
+  /**
+   * Number of worker threads for the worker pool
+   * Recommended: Number of CPU cores or 4, whichever is smaller
+   * @example 4
+   * @default 4
+   * @env WORKER_POOL_SIZE
+   */
+  @IsOptional()
+  @IsInt()
+  @Min(1)
+  @Max(16)
+  workerPoolSize = process.env.WORKER_POOL_SIZE ? parseInt(process.env.WORKER_POOL_SIZE, 10) : 4;
+
+  /**
+   * Enable batch processing optimizations in training
+   * Uses worker pool for parallel batch processing
+   * @example true
+   * @default false
+   * @env ENABLE_BATCH_OPTIMIZATION
+   */
+  @IsOptional()
+  @IsBoolean()
+  enableBatchOptimization = process.env.ENABLE_BATCH_OPTIMIZATION === 'true' || false;
+
+  /**
+   * Batch size for training operations
+   * Higher values use more memory but may be more efficient
+   * @example 2000
+   * @default 2000
+   * @env BATCH_SIZE
+   */
+  @IsOptional()
+  @IsInt()
+  @Min(100)
+  @Max(10000)
+  batchSize = process.env.BATCH_SIZE ? parseInt(process.env.BATCH_SIZE, 10) : 2000;
+
+  /**
+   * Memory limit for chain caching (in MB)
+   * MarkovStore will use LRU eviction when this limit is reached
+   * @example 256
+   * @default 128
+   * @env CHAIN_CACHE_MEMORY_LIMIT
+   */
+  @IsOptional()
+  @IsInt()
+  @Min(64)
+  @Max(2048)
+  chainCacheMemoryLimit = process.env.CHAIN_CACHE_MEMORY_LIMIT ? parseInt(process.env.CHAIN_CACHE_MEMORY_LIMIT, 10) : 128;
+
+  /**
+   * Debounce delay for chain persistence (in milliseconds)
+   * Higher values reduce disk I/O but increase risk of data loss
+   * @example 5000
+   * @default 5000
+   * @env CHAIN_SAVE_DEBOUNCE_MS
+   */
+  @IsOptional()
+  @IsInt()
+  @Min(1000)
+  @Max(30000)
+  chainSaveDebounceMs = process.env.CHAIN_SAVE_DEBOUNCE_MS ? parseInt(process.env.CHAIN_SAVE_DEBOUNCE_MS, 10) : 5000;
+
+  /**
+   * Percentage of guilds to enable optimizations for (0-100)
+   * Allows gradual rollout of performance optimizations
+   * @example 10
+   * @default 0
+   * @env OPTIMIZATION_ROLLOUT_PERCENTAGE
+   */
+  @IsOptional()
+  @IsNumber()
+  @Min(0)
+  @Max(100)
+  optimizationRolloutPercentage = process.env.OPTIMIZATION_ROLLOUT_PERCENTAGE ? parseFloat(process.env.OPTIMIZATION_ROLLOUT_PERCENTAGE) : 0;
+
+  /**
+   * List of guild IDs to force-enable optimizations for (canary testing)
+   * These guilds will always use optimizations regardless of rollout percentage
+   * @example ["1234567890", "0987654321"]
+   * @default []
+   * @env OPTIMIZATION_FORCE_GUILD_IDS (comma separated)
+   */
+  @IsArray()
+  @IsString({ each: true })
+  @Type(() => String)
+  @IsOptional()
+  optimizationForceGuildIds = process.env.OPTIMIZATION_FORCE_GUILD_IDS
+    ? process.env.OPTIMIZATION_FORCE_GUILD_IDS.split(',').map((id) => id.trim())
+    : [];
+
+  /**
+   * Enable performance monitoring and metrics collection
+   * Collects timing data for optimization validation
+   * @example true
+   * @default false
+   * @env ENABLE_PERFORMANCE_MONITORING
+   */
+  @IsOptional()
+  @IsBoolean()
+  enablePerformanceMonitoring = process.env.ENABLE_PERFORMANCE_MONITORING === 'true' || false;
 }
